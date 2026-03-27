@@ -16,6 +16,7 @@ const TELEGRAM_POLL_RESTART_POLICY = {
 
 const POLL_STALL_THRESHOLD_MS = 90_000;
 const POLL_WATCHDOG_INTERVAL_MS = 30_000;
+const POLL_STARTUP_TIMEOUT_MS = 10_000;
 const POLL_STOP_GRACE_MS = 15_000;
 
 const waitForGracefulStop = async (stop: () => Promise<void>) => {
@@ -137,10 +138,11 @@ export class TelegramPollingSession {
     const fetchAbortController = new AbortController();
     this.#activeFetchAbort = fetchAbortController;
     const shouldRebuildTransport = this.#discardTransportOnRestart || !this.#telegramTransport;
+    const nextTransport = this.opts.createTelegramTransport?.();
     const telegramTransport = shouldRebuildTransport
-      ? (this.opts.createTelegramTransport?.() ?? this.#telegramTransport)
+      ? (nextTransport ?? this.#telegramTransport)
       : this.#telegramTransport;
-    if (shouldRebuildTransport && telegramTransport) {
+    if (shouldRebuildTransport && nextTransport) {
       this.opts.log("[telegram][diag] rebuilding transport for next polling cycle");
     }
     this.#telegramTransport = telegramTransport;
@@ -295,9 +297,38 @@ export class TelegramPollingSession {
       }
 
       const now = Date.now();
+      const startupElapsed =
+        inFlightGetUpdates === 0 && lastGetUpdatesOutcome === "not-started"
+          ? now - lastGetUpdatesAt
+          : 0;
+      if (startupElapsed > POLL_STARTUP_TIMEOUT_MS && runner.isRunning()) {
+        this.#discardTransportOnRestart = true;
+        stalledRestart = true;
+        this.opts.log(
+          "[telegram] Polling startup stalled before first getUpdates; forcing restart.",
+        );
+        void stopRunner();
+        void stopBot();
+        if (!forceCycleTimer) {
+          forceCycleTimer = setTimeout(() => {
+            if (this.opts.abortSignal?.aborted) {
+              return;
+            }
+            this.opts.log(
+              `[telegram] Polling runner stop timed out after ${formatDurationPrecise(POLL_STOP_GRACE_MS)}; forcing restart cycle.`,
+            );
+            forceCycleResolve?.();
+          }, POLL_STOP_GRACE_MS);
+        }
+        return;
+      }
+
       const activeElapsed =
-        inFlightGetUpdates > 0 && lastGetUpdatesStartedAt != null ? now - lastGetUpdatesStartedAt : 0;
-      const idleElapsed = inFlightGetUpdates > 0 ? 0 : now - (lastGetUpdatesFinishedAt ?? lastGetUpdatesAt);
+        inFlightGetUpdates > 0 && lastGetUpdatesStartedAt != null
+          ? now - lastGetUpdatesStartedAt
+          : 0;
+      const idleElapsed =
+        inFlightGetUpdates > 0 ? 0 : now - (lastGetUpdatesFinishedAt ?? lastGetUpdatesAt);
       const elapsed = inFlightGetUpdates > 0 ? activeElapsed : idleElapsed;
 
       if (elapsed > POLL_STALL_THRESHOLD_MS && runner.isRunning()) {
@@ -336,15 +367,18 @@ export class TelegramPollingSession {
       if (this.opts.abortSignal?.aborted) {
         return "exit";
       }
+      const forceRestarted = this.#forceRestarted;
       const reason = stalledRestart
         ? "polling stall detected"
-        : this.#forceRestarted
+        : forceRestarted
           ? "unhandled network error"
           : "runner stopped (maxRetryTime exceeded or graceful stop)";
       this.#forceRestarted = false;
-      this.opts.log(
-        `[telegram][diag] polling cycle finished reason=${reason} inFlight=${inFlightGetUpdates} outcome=${lastGetUpdatesOutcome} startedAt=${lastGetUpdatesStartedAt ?? "n/a"} finishedAt=${lastGetUpdatesFinishedAt ?? "n/a"} durationMs=${lastGetUpdatesDurationMs ?? "n/a"} offset=${lastGetUpdatesOffset ?? "n/a"}${lastGetUpdatesError ? ` error=${lastGetUpdatesError}` : ""}`,
-      );
+      if (stalledRestart || forceRestarted || lastGetUpdatesOutcome === "error") {
+        this.opts.log(
+          `[telegram][diag] polling cycle finished reason=${reason} inFlight=${inFlightGetUpdates} outcome=${lastGetUpdatesOutcome} startedAt=${lastGetUpdatesStartedAt ?? "n/a"} finishedAt=${lastGetUpdatesFinishedAt ?? "n/a"} durationMs=${lastGetUpdatesDurationMs ?? "n/a"} offset=${lastGetUpdatesOffset ?? "n/a"}${lastGetUpdatesError ? ` error=${lastGetUpdatesError}` : ""}`,
+        );
+      }
       const shouldRestart = await this.#waitBeforeRestart(
         (delay) => `Telegram polling runner stopped (${reason}); restarting in ${delay}.`,
       );
