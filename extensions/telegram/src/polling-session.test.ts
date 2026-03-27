@@ -33,6 +33,106 @@ vi.mock("openclaw/plugin-sdk/infra-runtime", async (importOriginal) => {
 
 let TelegramPollingSession: typeof import("./polling-session.js").TelegramPollingSession;
 
+function makeBot() {
+  const bot = {
+    api: {
+      deleteWebhook: vi.fn(async () => true),
+      getUpdates: vi.fn(async () => []),
+      config: { use: vi.fn() },
+    },
+    stop: vi.fn(async () => undefined),
+    init: vi.fn(async () => undefined),
+    botInfo: { id: 123, is_bot: true, first_name: "Test", username: "testbot" },
+  };
+  return bot;
+}
+
+function installPollingStallWatchdogHarness() {
+  let watchdog: (() => void) | undefined;
+  const setIntervalSpy = vi.spyOn(globalThis, "setInterval").mockImplementation((fn) => {
+    watchdog = fn as () => void;
+    return 1 as unknown as ReturnType<typeof setInterval>;
+  });
+  const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval").mockImplementation(() => {});
+  const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation((fn) => {
+    void Promise.resolve().then(() => (fn as () => void)());
+    return 1 as unknown as ReturnType<typeof setTimeout>;
+  });
+  const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout").mockImplementation(() => {});
+  const dateNowSpy = vi.spyOn(Date, "now").mockImplementationOnce(() => 0).mockImplementation(() => 120_001);
+
+  return {
+    async waitForWatchdog() {
+      for (let attempt = 0; attempt < 20 && !watchdog; attempt += 1) {
+        await Promise.resolve();
+      }
+      expect(watchdog).toBeTypeOf("function");
+      return watchdog;
+    },
+    restore() {
+      setIntervalSpy.mockRestore();
+      clearIntervalSpy.mockRestore();
+      setTimeoutSpy.mockRestore();
+      clearTimeoutSpy.mockRestore();
+      dateNowSpy.mockRestore();
+    },
+  };
+}
+
+function expectTelegramBotTransportSequence(firstTransport: unknown, secondTransport: unknown) {
+  expect(createTelegramBotMock).toHaveBeenCalledTimes(2);
+  expect(createTelegramBotMock.mock.calls[0]?.[0]?.telegramTransport).toBe(firstTransport);
+  expect(createTelegramBotMock.mock.calls[1]?.[0]?.telegramTransport).toBe(secondTransport);
+}
+
+function makeTelegramTransport() {
+  return { fetch: globalThis.fetch, sourceFetch: globalThis.fetch };
+}
+
+function mockRestartAfterPollingError(error: unknown, abort: AbortController) {
+  let firstCycle = true;
+  runMock.mockImplementation(() => {
+    if (firstCycle) {
+      firstCycle = false;
+      return {
+        task: async () => {
+          throw error;
+        },
+        stop: vi.fn(async () => undefined),
+        isRunning: () => false,
+      };
+    }
+    return {
+      task: async () => {
+        abort.abort();
+      },
+      stop: vi.fn(async () => undefined),
+      isRunning: () => false,
+    };
+  });
+}
+
+function createPollingSessionWithTransportRestart(params: {
+  abortSignal: AbortSignal;
+  telegramTransport: ReturnType<typeof makeTelegramTransport>;
+  createTelegramTransport: () => ReturnType<typeof makeTelegramTransport>;
+}) {
+  return new TelegramPollingSession({
+    token: "tok",
+    config: {},
+    accountId: "default",
+    runtime: undefined,
+    proxyFetch: undefined,
+    abortSignal: params.abortSignal,
+    runnerOptions: {},
+    getLastUpdateId: () => null,
+    persistUpdateId: async () => undefined,
+    log: () => undefined,
+    telegramTransport: params.telegramTransport,
+    createTelegramTransport: params.createTelegramTransport,
+  });
+}
+
 describe("TelegramPollingSession", () => {
   beforeEach(async () => {
     vi.resetModules();
@@ -56,6 +156,8 @@ describe("TelegramPollingSession", () => {
         config: { use: vi.fn() },
       },
       stop: botStop,
+      init: vi.fn(async () => undefined),
+      botInfo: { id: 123, is_bot: true, first_name: "Test", username: "testbot" },
     };
     createTelegramBotMock.mockReturnValue(bot);
 
@@ -113,6 +215,8 @@ describe("TelegramPollingSession", () => {
         config: { use: vi.fn() },
       },
       stop: botStop,
+      init: vi.fn(async () => undefined),
+      botInfo: { id: 123, is_bot: true, first_name: "Test", username: "testbot" },
     };
     createTelegramBotMock.mockReturnValue(bot);
 
