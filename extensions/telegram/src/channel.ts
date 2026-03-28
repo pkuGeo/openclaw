@@ -602,6 +602,7 @@ export const telegramPlugin = createChatChannelPlugin({
           webhookHost: account.config.webhookHost,
           webhookPort: account.config.webhookPort,
           webhookCertPath: account.config.webhookCertPath,
+          logDebug: ctx.log?.debug ? (line: string) => ctx.log?.debug?.(line) : undefined,
         });
       },
       logoutAccount: async ({ accountId, cfg }) => {

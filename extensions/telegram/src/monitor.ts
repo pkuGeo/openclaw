@@ -33,6 +33,8 @@ export type MonitorTelegramOpts = {
   proxyFetch?: typeof fetch;
   webhookUrl?: string;
   webhookCertPath?: string;
+  /** Optional debug-level logger. When provided, low-noise heartbeat messages are routed here instead of info. */
+  logDebug?: (line: string) => void;
 };
 
 export function createTelegramRunnerOptions(cfg: OpenClawConfig): RunOptions<unknown> {
@@ -202,6 +204,7 @@ export async function monitorTelegramProvider(opts: MonitorTelegramOpts = {}) {
       log,
       logInfo,
       logError: log,
+      logDebug: opts.logDebug,
       telegramTransport,
       createTelegramTransport: createTelegramTransportForPolling,
     });

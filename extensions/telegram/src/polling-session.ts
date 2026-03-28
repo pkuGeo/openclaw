@@ -56,6 +56,7 @@ type TelegramPollingSessionOpts = {
   log: (line: string) => void;
   logInfo?: (line: string) => void;
   logError?: (line: string) => void;
+  logDebug?: (line: string) => void;
   /** Pre-resolved Telegram transport to reuse across bot instances */
   telegramTransport?: TelegramTransport;
   /** Rebuild Telegram transport after stall/network recovery when marked dirty. */
@@ -95,6 +96,11 @@ export class TelegramPollingSession {
 
   constructor(private readonly opts: TelegramPollingSessionOpts) {
     this.#telegramTransport = opts.telegramTransport;
+  }
+
+  /** No-op when logDebug is not provided, keeping noisy-but-benign messages off info logs. */
+  #debug(line: string): void {
+    this.opts.logDebug?.(line);
   }
 
   get activeRunner() {
@@ -139,7 +145,7 @@ export class TelegramPollingSession {
           );
           this.#waitingForHeartbeatRecovery = false;
         } else if (this.#failCnt > 0) {
-          (this.opts.logInfo ?? this.opts.log)(
+          this.#debug(
             `[telegram] Heartbeat recovered after ${this.#failCnt} consecutive failure(s).`,
           );
         }
@@ -153,7 +159,7 @@ export class TelegramPollingSession {
       } else {
         this.#failCnt += 1;
         if (!this.#waitingForHeartbeatRecovery) {
-          (this.opts.logInfo ?? this.opts.log)(
+          this.#debug(
             `[telegram] Heartbeat failed (${this.#failCnt}/${HEARTBEAT_FAIL_THRESHOLD}).`,
           );
         }
