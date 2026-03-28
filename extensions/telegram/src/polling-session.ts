@@ -15,8 +15,13 @@ const TELEGRAM_POLL_RESTART_POLICY = {
   jitter: 0.25,
 };
 
-const POLL_STALL_THRESHOLD_MS = 90_000;
-const POLL_WATCHDOG_INTERVAL_MS = 30_000;
+/** Heartbeat supervisor constants */
+const HEARTBEAT_INTERVAL_MS = 5_000;
+const HEARTBEAT_TIMEOUT_MS = 5_000;
+const HEARTBEAT_FAIL_THRESHOLD = 3;
+const HEARTBEAT_STALE_THRESHOLD_MS = 45_000;
+const UPDATES_STALE_THRESHOLD_MS = 45_000;
+
 const POLL_STOP_GRACE_MS = 15_000;
 
 const waitForGracefulStop = async (stop: () => Promise<void>) => {
@@ -49,24 +54,44 @@ type TelegramPollingSessionOpts = {
   getLastUpdateId: () => number | null;
   persistUpdateId: (updateId: number) => Promise<void>;
   log: (line: string) => void;
+  logInfo?: (line: string) => void;
+  logError?: (line: string) => void;
   /** Pre-resolved Telegram transport to reuse across bot instances */
   telegramTransport?: TelegramTransport;
   /** Rebuild Telegram transport after stall/network recovery when marked dirty. */
   createTelegramTransport?: () => TelegramTransport;
 };
 
+/**
+ * Managed polling instance — the "getUpdates connection" that the supervisor
+ * creates on heartbeat success and destroys on network failure.
+ */
+type PollingInstance = {
+  bot: TelegramBot;
+  runner: ReturnType<typeof run>;
+  fetchAbortController: AbortController;
+  /** Resolves when the runner finishes (normally or via force). */
+  task: Promise<void>;
+  /** Signal the force-cycle path. */
+  forceCycleResolve: () => void;
+};
+
 export class TelegramPollingSession {
   #restartAttempts = 0;
   #webhookCleared = false;
-  #forceRestarted = false;
   #activeRunner: ReturnType<typeof run> | undefined;
   #activeFetchAbort: AbortController | undefined;
   #telegramTransport: TelegramTransport | undefined;
   #discardTransportOnRestart = false;
-  /** Cached botInfo from the first successful `getMe()` call.
-   *  Passed to subsequent Bot instances so grammy skips `bot.init()` → `getMe()`,
-   *  eliminating the init-retry stall after network recovery. */
+  /** Cached botInfo from the first successful `getMe()` call. */
   #cachedBotInfo: UserFromGetMe | undefined;
+
+  /** Supervisor state */
+  #hbSucTime = Date.now();
+  #updSucTime = Date.now();
+  #failCnt = 0;
+  #waitingForHeartbeatRecovery = false;
+  #pollingInstance: PollingInstance | undefined;
 
   constructor(private readonly opts: TelegramPollingSessionOpts) {
     this.#telegramTransport = opts.telegramTransport;
@@ -77,7 +102,10 @@ export class TelegramPollingSession {
   }
 
   markForceRestarted() {
-    this.#forceRestarted = true;
+    // Used by external unhandled-rejection handler.
+    if (this.#pollingInstance) {
+      this.#destroyPollingInstance("unhandled network error");
+    }
   }
 
   markTransportDirty() {
@@ -88,55 +116,233 @@ export class TelegramPollingSession {
     this.#activeFetchAbort?.abort();
   }
 
+  // ─── Supervisor entry point ───────────────────────────────────────────
+
   async runUntilAbort(): Promise<void> {
+    const now0 = Date.now();
+    this.#hbSucTime = now0;
+    this.#updSucTime = now0;
+    this.#failCnt = 0;
+
     while (!this.opts.abortSignal?.aborted) {
-      const bot = await this.#createPollingBot();
-      if (!bot) {
-        continue;
-      }
+      // ── Heartbeat: probe getMe() ──
+      const healthy = await this.#heartbeat();
 
-      const cleanupState = await this.#ensureWebhookCleanup(bot);
-      if (cleanupState === "retry") {
-        continue;
-      }
-      if (cleanupState === "exit") {
-        return;
-      }
-
-      const state = await this.#runPollingCycle(bot);
-      if (state === "exit") {
-        return;
-      }
-    }
-  }
-
-  async #waitBeforeRestart(buildLine: (delay: string) => string): Promise<boolean> {
-    this.#restartAttempts += 1;
-    const delayMs = computeBackoff(TELEGRAM_POLL_RESTART_POLICY, this.#restartAttempts);
-    const delay = formatDurationPrecise(delayMs);
-    this.opts.log(buildLine(delay));
-    try {
-      await sleepWithAbort(delayMs, this.opts.abortSignal);
-    } catch (sleepErr) {
       if (this.opts.abortSignal?.aborted) {
-        return false;
+        break;
       }
-      throw sleepErr;
+
+      if (healthy) {
+        if (this.#waitingForHeartbeatRecovery) {
+          (this.opts.logInfo ?? this.opts.log)(
+            "[telegram] Heartbeat recovered; restarting polling instance.",
+          );
+          this.#waitingForHeartbeatRecovery = false;
+        } else if (this.#failCnt > 0) {
+          (this.opts.logInfo ?? this.opts.log)(
+            `[telegram] Heartbeat recovered after ${this.#failCnt} consecutive failure(s).`,
+          );
+        }
+        this.#hbSucTime = Date.now();
+        this.#failCnt = 0;
+
+        // Ensure a polling instance is running.
+        if (!this.#pollingInstance) {
+          await this.#startPollingInstance();
+        }
+      } else {
+        this.#failCnt += 1;
+        if (!this.#waitingForHeartbeatRecovery) {
+          (this.opts.logInfo ?? this.opts.log)(
+            `[telegram] Heartbeat failed (${this.#failCnt}/${HEARTBEAT_FAIL_THRESHOLD}).`,
+          );
+        }
+      }
+
+      // ── Check destroy conditions ──
+      const now = Date.now();
+      const hbStale = now - this.#hbSucTime > HEARTBEAT_STALE_THRESHOLD_MS;
+      const updStale = this.#pollingInstance && now - this.#updSucTime > UPDATES_STALE_THRESHOLD_MS;
+      if (
+        this.#pollingInstance &&
+        (this.#failCnt >= HEARTBEAT_FAIL_THRESHOLD || hbStale || updStale)
+      ) {
+        const reason =
+          this.#failCnt >= HEARTBEAT_FAIL_THRESHOLD
+            ? `${HEARTBEAT_FAIL_THRESHOLD} consecutive heartbeat failures`
+            : hbStale
+              ? `heartbeat stale for ${formatDurationPrecise(now - this.#hbSucTime)}`
+              : `getUpdates stale for ${formatDurationPrecise(now - this.#updSucTime)}`;
+        this.#destroyPollingInstance(reason);
+        this.#waitingForHeartbeatRecovery = true;
+        // Mark transport dirty so next creation rebuilds it.
+        this.#discardTransportOnRestart = true;
+      }
+
+      // ── Also check if polling instance died on its own ──
+      if (this.#pollingInstance) {
+        this.#checkPollingInstanceHealth();
+      }
+
+      // ── Wait for next heartbeat tick ──
+      try {
+        await sleepWithAbort(HEARTBEAT_INTERVAL_MS, this.opts.abortSignal);
+      } catch {
+        if (this.opts.abortSignal?.aborted) {
+          break;
+        }
+      }
     }
-    return true;
+
+    // Cleanup on exit.
+    if (this.#pollingInstance) {
+      this.#destroyPollingInstance("session aborted");
+    }
   }
 
-  async #waitBeforeRetryOnRecoverableSetupError(err: unknown, logPrefix: string): Promise<boolean> {
-    if (this.opts.abortSignal?.aborted) {
+  // ─── Heartbeat ────────────────────────────────────────────────────────
+
+  async #heartbeat(): Promise<boolean> {
+    const abort = new AbortController();
+    const timeout = setTimeout(() => abort.abort(), HEARTBEAT_TIMEOUT_MS);
+    try {
+      // Use a lightweight API call. We need a Bot instance for this,
+      // but if we don't have one yet, fall back to a raw fetch.
+      if (this.#pollingInstance) {
+        await this.#pollingInstance.bot.api.getMe(abort.signal as never);
+      } else {
+        // No active bot — do a raw fetch to check connectivity.
+        const url = `https://api.telegram.org/bot${this.opts.token}/getMe`;
+        const fetchFn = this.opts.proxyFetch ?? globalThis.fetch;
+        const res = await fetchFn(url, {
+          signal: abort.signal,
+          method: "GET",
+        });
+        if (!res.ok) {
+          return false;
+        }
+      }
+      return true;
+    } catch {
       return false;
+    } finally {
+      clearTimeout(timeout);
     }
-    if (!isRecoverableTelegramNetworkError(err, { context: "unknown" })) {
-      throw err;
-    }
-    return this.#waitBeforeRestart(
-      (delay) => `${logPrefix}: ${formatErrorMessage(err)}; retrying in ${delay}.`,
-    );
   }
+
+  // ─── Polling instance lifecycle ───────────────────────────────────────
+
+  async #startPollingInstance(): Promise<void> {
+    const bot = await this.#createPollingBot();
+    if (!bot) {
+      return;
+    }
+
+    const cleanupState = await this.#ensureWebhookCleanup(bot);
+    if (cleanupState !== "ready") {
+      return;
+    }
+
+    await this.#confirmPersistedOffset(bot);
+
+    const fetchAbortController = this.#activeFetchAbort!;
+
+    // ── Wire getUpdates middleware to update upd_suc_time ──
+    bot.api.config.use(async (prev, method, payload, signal) => {
+      if (method !== "getUpdates") {
+        return prev(method, payload, signal);
+      }
+      try {
+        const result = await prev(method, payload, signal);
+        // getUpdates returned successfully → polling data plane is healthy.
+        this.#updSucTime = Date.now();
+        return result;
+      } catch (err) {
+        throw err;
+      }
+    });
+
+    const runner = run(bot, this.opts.runnerOptions);
+    this.#activeRunner = runner;
+
+    // Forward session abort to fetch abort.
+    const abortFetch = () => fetchAbortController?.abort();
+    if (this.opts.abortSignal && fetchAbortController) {
+      this.opts.abortSignal.addEventListener("abort", abortFetch, { once: true });
+    }
+
+    let forceCycleResolve!: () => void;
+    const forceCyclePromise = new Promise<void>((resolve) => {
+      forceCycleResolve = resolve;
+    });
+
+    // The task promise resolves when the runner finishes or is force-cycled.
+    const task = Promise.race([runner.task(), forceCyclePromise])
+      .catch(() => {
+        // Swallow — lifecycle errors are handled by the supervisor.
+      })
+      .finally(() => {
+        this.opts.abortSignal?.removeEventListener("abort", abortFetch);
+        // If this instance is still the active one, clear it.
+        if (this.#pollingInstance?.runner === runner) {
+          (this.opts.logInfo ?? this.opts.log)("[telegram] Polling instance stopped on its own.");
+          this.#pollingInstance = undefined;
+          this.#activeRunner = undefined;
+        }
+      });
+
+    this.#pollingInstance = {
+      bot,
+      runner,
+      fetchAbortController,
+      task,
+      forceCycleResolve,
+    };
+
+    this.#updSucTime = Date.now();
+    this.#restartAttempts = 0;
+    (this.opts.logInfo ?? this.opts.log)("[telegram] Polling instance started.");
+  }
+
+  #destroyPollingInstance(reason: string): void {
+    const instance = this.#pollingInstance;
+    if (!instance) {
+      return;
+    }
+    (this.opts.logError ?? this.opts.log)(`[telegram] Destroying polling instance: ${reason}.`);
+    this.#pollingInstance = undefined;
+    this.#activeRunner = undefined;
+
+    // Abort all in-flight fetches.
+    instance.fetchAbortController.abort();
+
+    // Stop runner + bot gracefully, with a timeout fallback.
+    const stopRunner = () => Promise.resolve(instance.runner.stop()).catch(() => {});
+    const stopBot = () => Promise.resolve(instance.bot.stop()).catch(() => {});
+
+    void waitForGracefulStop(stopRunner);
+    void waitForGracefulStop(stopBot);
+
+    // Force-cycle in case stop hangs.
+    instance.forceCycleResolve();
+  }
+
+  #checkPollingInstanceHealth(): void {
+    const instance = this.#pollingInstance;
+    if (!instance) {
+      return;
+    }
+    // If the runner is no longer running, the instance is dead.
+    if (!instance.runner.isRunning()) {
+      (this.opts.logInfo ?? this.opts.log)(
+        "[telegram] Polling runner is no longer running; clearing instance.",
+      );
+      this.#pollingInstance = undefined;
+      this.#activeRunner = undefined;
+    }
+  }
+
+  // ─── Bot creation (kept from original) ────────────────────────────────
 
   async #createPollingBot(): Promise<TelegramBot | undefined> {
     const fetchAbortController = new AbortController();
@@ -146,7 +352,9 @@ export class TelegramPollingSession {
       ? (this.opts.createTelegramTransport?.() ?? this.#telegramTransport)
       : this.#telegramTransport;
     if (shouldRebuildTransport && telegramTransport) {
-      this.opts.log("[telegram][diag] rebuilding transport for next polling cycle");
+      (this.opts.logInfo ?? this.opts.log)(
+        "[telegram][diag] rebuilding transport for next polling cycle",
+      );
     }
     this.#telegramTransport = telegramTransport;
     this.#discardTransportOnRestart = false;
@@ -166,50 +374,28 @@ export class TelegramPollingSession {
         botInfo: this.#cachedBotInfo,
       });
       // On the first cycle, eagerly init the bot so we can cache botInfo.
-      // Subsequent cycles already have botInfo injected into the Bot constructor,
-      // so bot.init() inside the runner will be a no-op (isInited() === true).
       if (!this.#cachedBotInfo) {
-        // Use a dedicated abort controller for the eager init so that a timeout
-        // does not poison the bot's fetch pipeline (fetchAbortController stays
-        // intact for the polling cycle that follows).
         const EAGER_INIT_TIMEOUT_MS = 15_000;
         const initAbort = new AbortController();
-
-        // Forward session-level abort → init controller.
-        // Guard against the race where abort fires between the while-loop
-        // check and this point — an already-aborted signal won't fire the
-        // listener, so we must check eagerly.
         const onSessionAbort = () => initAbort.abort();
         if (this.opts.abortSignal?.aborted) {
           initAbort.abort();
         } else {
           this.opts.abortSignal?.addEventListener("abort", onSessionAbort, { once: true });
         }
-
-        // Time-box the init so a stalled network cannot block the session
-        // outside the watchdog's protection.
         const initTimeout = setTimeout(() => initAbort.abort(), EAGER_INIT_TIMEOUT_MS);
         try {
-          // grammy's init() accepts AbortSignal from the `abort-controller` polyfill package,
-          // which is structurally incompatible with the native Node.js AbortSignal at the type
-          // level. At runtime they are interchangeable, so we suppress the type error.
-          // @ts-ignore — grammy AbortSignal (abort-controller polyfill) vs native Node.js AbortSignal
+          // @ts-ignore — grammy AbortSignal vs native Node.js AbortSignal
           await bot.init(initAbort.signal);
           this.#cachedBotInfo = bot.botInfo;
-          this.opts.log(
+          (this.opts.logInfo ?? this.opts.log)(
             "[telegram] Cached botInfo from initial getMe(); subsequent cycles will skip init.",
           );
         } catch {
-          // If the session itself was aborted, short-circuit immediately so
-          // runUntilAbort() does not continue into webhook cleanup / polling
-          // setup over the still-live fetchAbortController.
           if (this.opts.abortSignal?.aborted) {
             return undefined;
           }
-          // Otherwise non-fatal: network unavailable or timeout fired.
-          // The runner will call bot.init() itself with its own retry logic
-          // under the watchdog. We skip caching and let the existing code
-          // path handle it.
+          // Non-fatal: network unavailable or timeout fired.
         } finally {
           clearTimeout(initTimeout);
           this.opts.abortSignal?.removeEventListener("abort", onSessionAbort);
@@ -254,218 +440,37 @@ export class TelegramPollingSession {
     try {
       await bot.api.getUpdates({ offset: lastUpdateId + 1, limit: 1, timeout: 0 });
     } catch {
-      // Non-fatal: runner middleware still skips duplicates via shouldSkipUpdate.
+      // Non-fatal.
     }
   }
 
-  async #runPollingCycle(bot: TelegramBot): Promise<"continue" | "exit"> {
-    await this.#confirmPersistedOffset(bot);
+  // ─── Helpers ──────────────────────────────────────────────────────────
 
-    let lastGetUpdatesAt = Date.now();
-    let lastGetUpdatesStartedAt: number | null = null;
-    let lastGetUpdatesFinishedAt: number | null = null;
-    let lastGetUpdatesDurationMs: number | null = null;
-    let lastGetUpdatesOutcome = "not-started";
-    let lastGetUpdatesError: string | null = null;
-    let lastGetUpdatesOffset: number | null = null;
-    let inFlightGetUpdates = 0;
-    let stopSequenceLogged = false;
-    let stallDiagLoggedAt = 0;
-
-    bot.api.config.use(async (prev, method, payload, signal) => {
-      if (method !== "getUpdates") {
-        return prev(method, payload, signal);
-      }
-
-      const startedAt = Date.now();
-      lastGetUpdatesAt = startedAt;
-      lastGetUpdatesStartedAt = startedAt;
-      lastGetUpdatesOffset =
-        payload && typeof payload === "object" && "offset" in payload
-          ? ((payload as { offset?: number }).offset ?? null)
-          : null;
-      inFlightGetUpdates += 1;
-      lastGetUpdatesOutcome = "started";
-      lastGetUpdatesError = null;
-
-      try {
-        const result = await prev(method, payload, signal);
-        const finishedAt = Date.now();
-        lastGetUpdatesFinishedAt = finishedAt;
-        lastGetUpdatesDurationMs = finishedAt - startedAt;
-        lastGetUpdatesOutcome = Array.isArray(result) ? `ok:${result.length}` : "ok";
-        return result;
-      } catch (err) {
-        const finishedAt = Date.now();
-        lastGetUpdatesFinishedAt = finishedAt;
-        lastGetUpdatesDurationMs = finishedAt - startedAt;
-        lastGetUpdatesOutcome = "error";
-        lastGetUpdatesError = formatErrorMessage(err);
-        throw err;
-      } finally {
-        inFlightGetUpdates = Math.max(0, inFlightGetUpdates - 1);
-      }
-    });
-
-    const runner = run(bot, this.opts.runnerOptions);
-    this.#activeRunner = runner;
-    const fetchAbortController = this.#activeFetchAbort;
-    const abortFetch = () => {
-      fetchAbortController?.abort();
-    };
-
-    if (this.opts.abortSignal && fetchAbortController) {
-      this.opts.abortSignal.addEventListener("abort", abortFetch, { once: true });
-    }
-    let stopPromise: Promise<void> | undefined;
-    let stalledRestart = false;
-    let forceCycleTimer: ReturnType<typeof setTimeout> | undefined;
-    let forceCycleResolve: (() => void) | undefined;
-    const forceCyclePromise = new Promise<void>((resolve) => {
-      forceCycleResolve = resolve;
-    });
-    const stopRunner = () => {
-      fetchAbortController?.abort();
-      stopPromise ??= Promise.resolve(runner.stop())
-        .then(() => undefined)
-        .catch(() => {
-          // Runner may already be stopped by abort/retry paths.
-        });
-      return stopPromise;
-    };
-    const stopBot = () => {
-      return Promise.resolve(bot.stop())
-        .then(() => undefined)
-        .catch(() => {
-          // Bot may already be stopped by runner stop/abort paths.
-        });
-    };
-    const stopOnAbort = () => {
-      if (this.opts.abortSignal?.aborted) {
-        void stopRunner();
-      }
-    };
-
-    const watchdog = setInterval(() => {
-      if (this.opts.abortSignal?.aborted) {
-        return;
-      }
-
-      const now = Date.now();
-      const activeElapsed =
-        inFlightGetUpdates > 0 && lastGetUpdatesStartedAt != null ? now - lastGetUpdatesStartedAt : 0;
-      const idleElapsed = inFlightGetUpdates > 0 ? 0 : now - (lastGetUpdatesFinishedAt ?? lastGetUpdatesAt);
-      const elapsed = inFlightGetUpdates > 0 ? activeElapsed : idleElapsed;
-
-      if (elapsed > POLL_STALL_THRESHOLD_MS && runner.isRunning()) {
-        if (stallDiagLoggedAt && now - stallDiagLoggedAt < POLL_STALL_THRESHOLD_MS / 2) {
-          return;
-        }
-        stallDiagLoggedAt = now;
-        this.#discardTransportOnRestart = true;
-        stalledRestart = true;
-        const elapsedLabel =
-          inFlightGetUpdates > 0
-            ? `active getUpdates stuck for ${formatDurationPrecise(elapsed)}`
-            : `no completed getUpdates for ${formatDurationPrecise(elapsed)}`;
-        this.opts.log(
-          `[telegram] Polling stall detected (${elapsedLabel}); forcing restart. [diag inFlight=${inFlightGetUpdates} outcome=${lastGetUpdatesOutcome} startedAt=${lastGetUpdatesStartedAt ?? "n/a"} finishedAt=${lastGetUpdatesFinishedAt ?? "n/a"} durationMs=${lastGetUpdatesDurationMs ?? "n/a"} offset=${lastGetUpdatesOffset ?? "n/a"}${lastGetUpdatesError ? ` error=${lastGetUpdatesError}` : ""}]`,
-        );
-        void stopRunner();
-        void stopBot();
-        if (!forceCycleTimer) {
-          forceCycleTimer = setTimeout(() => {
-            if (this.opts.abortSignal?.aborted) {
-              return;
-            }
-            this.opts.log(
-              `[telegram] Polling runner stop timed out after ${formatDurationPrecise(POLL_STOP_GRACE_MS)}; forcing restart cycle.`,
-            );
-            forceCycleResolve?.();
-          }, POLL_STOP_GRACE_MS);
-        }
-      }
-    }, POLL_WATCHDOG_INTERVAL_MS);
-
-    this.opts.abortSignal?.addEventListener("abort", stopOnAbort, { once: true });
+  async #waitBeforeRestart(buildLine: (delay: string) => string): Promise<boolean> {
+    this.#restartAttempts += 1;
+    const delayMs = computeBackoff(TELEGRAM_POLL_RESTART_POLICY, this.#restartAttempts);
+    const delay = formatDurationPrecise(delayMs);
+    this.opts.log(buildLine(delay));
     try {
-      await Promise.race([runner.task(), forceCyclePromise]);
+      await sleepWithAbort(delayMs, this.opts.abortSignal);
+    } catch (sleepErr) {
       if (this.opts.abortSignal?.aborted) {
-        return "exit";
+        return false;
       }
-      const reason = stalledRestart
-        ? "polling stall detected"
-        : this.#forceRestarted
-          ? "unhandled network error"
-          : "runner stopped (maxRetryTime exceeded or graceful stop)";
-      this.#forceRestarted = false;
-      this.opts.log(
-        `[telegram][diag] polling cycle finished reason=${reason} inFlight=${inFlightGetUpdates} outcome=${lastGetUpdatesOutcome} startedAt=${lastGetUpdatesStartedAt ?? "n/a"} finishedAt=${lastGetUpdatesFinishedAt ?? "n/a"} durationMs=${lastGetUpdatesDurationMs ?? "n/a"} offset=${lastGetUpdatesOffset ?? "n/a"}${lastGetUpdatesError ? ` error=${lastGetUpdatesError}` : ""}`,
-      );
-      const shouldRestart = await this.#waitBeforeRestart(
-        (delay) => `Telegram polling runner stopped (${reason}); restarting in ${delay}.`,
-      );
-      return shouldRestart ? "continue" : "exit";
-    } catch (err) {
-      this.#forceRestarted = false;
-      if (this.opts.abortSignal?.aborted) {
-        throw err;
-      }
-      const isConflict = isGetUpdatesConflict(err);
-      if (isConflict) {
-        this.#webhookCleared = false;
-      }
-      const isRecoverable = isRecoverableTelegramNetworkError(err, { context: "polling" });
-      if (isConflict || isRecoverable) {
-        this.#discardTransportOnRestart = true;
-      }
-      if (!isConflict && !isRecoverable) {
-        throw err;
-      }
-      const reason = isConflict ? "getUpdates conflict" : "network error";
-      const errMsg = formatErrorMessage(err);
-      this.opts.log(
-        `[telegram][diag] polling cycle error reason=${reason} inFlight=${inFlightGetUpdates} outcome=${lastGetUpdatesOutcome} startedAt=${lastGetUpdatesStartedAt ?? "n/a"} finishedAt=${lastGetUpdatesFinishedAt ?? "n/a"} durationMs=${lastGetUpdatesDurationMs ?? "n/a"} offset=${lastGetUpdatesOffset ?? "n/a"} err=${errMsg}${lastGetUpdatesError ? ` lastGetUpdatesError=${lastGetUpdatesError}` : ""}`,
-      );
-      const shouldRestart = await this.#waitBeforeRestart(
-        (delay) => `Telegram ${reason}: ${errMsg}; retrying in ${delay}.`,
-      );
-      return shouldRestart ? "continue" : "exit";
-    } finally {
-      clearInterval(watchdog);
-      if (forceCycleTimer) {
-        clearTimeout(forceCycleTimer);
-      }
-      this.opts.abortSignal?.removeEventListener("abort", abortFetch);
-      this.opts.abortSignal?.removeEventListener("abort", stopOnAbort);
-      await waitForGracefulStop(stopRunner);
-      await waitForGracefulStop(stopBot);
-      this.#activeRunner = undefined;
-      if (this.#activeFetchAbort === fetchAbortController) {
-        this.#activeFetchAbort = undefined;
-      }
+      throw sleepErr;
     }
+    return true;
+  }
+
+  async #waitBeforeRetryOnRecoverableSetupError(err: unknown, logPrefix: string): Promise<boolean> {
+    if (this.opts.abortSignal?.aborted) {
+      return false;
+    }
+    if (!isRecoverableTelegramNetworkError(err, { context: "unknown" })) {
+      throw err;
+    }
+    return this.#waitBeforeRestart(
+      (delay) => `${logPrefix}: ${formatErrorMessage(err)}; retrying in ${delay}.`,
+    );
   }
 }
-
-const isGetUpdatesConflict = (err: unknown) => {
-  if (!err || typeof err !== "object") {
-    return false;
-  }
-  const typed = err as {
-    error_code?: number;
-    errorCode?: number;
-    description?: string;
-    method?: string;
-    message?: string;
-  };
-  const errorCode = typed.error_code ?? typed.errorCode;
-  if (errorCode !== 409) {
-    return false;
-  }
-  const haystack = [typed.method, typed.description, typed.message]
-    .filter((value): value is string => typeof value === "string")
-    .join(" ")
-    .toLowerCase();
-  return haystack.includes("getupdates");
-};

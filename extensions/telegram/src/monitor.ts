@@ -77,6 +77,7 @@ const isGrammyHttpError = (err: unknown): boolean => {
 
 export async function monitorTelegramProvider(opts: MonitorTelegramOpts = {}) {
   const log = opts.runtime?.error ?? console.error;
+  const logInfo = opts.runtime?.log ?? console.log;
   let pollingSession: TelegramPollingSession | undefined;
   let execApprovalsHandler: TelegramExecApprovalHandler | undefined;
 
@@ -199,6 +200,8 @@ export async function monitorTelegramProvider(opts: MonitorTelegramOpts = {}) {
       getLastUpdateId: () => lastUpdateId,
       persistUpdateId,
       log,
+      logInfo,
+      logError: log,
       telegramTransport,
       createTelegramTransport: createTelegramTransportForPolling,
     });
