@@ -315,7 +315,12 @@ export class TelegramPollingSession {
     if (!instance) {
       return;
     }
-    (this.opts.logError ?? this.opts.log)(`[telegram] Destroying polling instance: ${reason}.`);
+    // "session aborted" is a normal shutdown path; use info for graceful stops.
+    const logDestroy =
+      reason === "session aborted"
+        ? (this.opts.logInfo ?? this.opts.log)
+        : (this.opts.logError ?? this.opts.log);
+    logDestroy(`[telegram] Destroying polling instance: ${reason}.`);
     this.#pollingInstance = undefined;
     this.#activeRunner = undefined;
 
